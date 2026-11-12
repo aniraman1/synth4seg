@@ -8,13 +8,19 @@ GPU port of the original body + blobs + trees method:
     (random Fourier features). That keeps every blob connected and hole-free by
     construction. Each blob is evaluated only inside a fixed-size crop around it (static
     shapes), and later blobs overwrite earlier ones.
-  * trees: IFS skeletons are grown on the CPU (vectorized numpy, about 2 ms per volume),
+  * trees: IFS skeletons are grown on the CPU (vectorized numpy, about 1 ms per volume),
     starting inside the body and growing inwards. They are splatted on the device as
     balls. Trees are painted last, in order, so a later tree overwrites blobs and earlier
     trees.
   Blobs and trees are clipped to the body.
   * image: SynthSeg-style GMM -> per-sample Gaussian blur -> smooth bias field -> noise.
-Only basic ops are used (MPS lacks 3D interpolate, scatter_reduce, max_pool3d and cummin).
+Two code paths:
+  * CUDA / CPU (fast): all blobs evaluated in one batched call and written with a single
+    scatter_reduce(amax); trees with one amax-scatter per radius bucket; blur as banded-matrix
+    matmuls; no host syncs in sample(). On CUDA the star-shape test is fused with torch.compile.
+  * MPS (compat): only basic ops (MPS lacks 3D interpolate, scatter_reduce, max_pool3d and
+    cummin); padded flat buffers with dummy slots, power-of-two point groups.
+Benchmark: python bench.py --batch 1 4 8 16
 """
 import math
 
@@ -48,6 +54,32 @@ def upsample3d(low, W):
     x = torch.einsum("...ijk,zk->...ijz", low, W)
     x = torch.einsum("...ijz,yj->...iyz", x, W)
     return torch.einsum("...iyz,xi->...xyz", x, W).contiguous()
+
+
+# --------------------------------------------------------------------------- fused (CUDA)
+def star_field_ew(G, off, A, f, ph, amp, rough):
+    """Elementwise form of SynthGenerator._star_field (same signature, (K,V) bool result).
+    Written so torch.compile fuses it into a single kernel: no (K,V,M) intermediate."""
+    g = [G[None, :, j] + off[:, j, None] for j in range(3)]               # (K,V) each
+    q = [g[0] * A[:, 0, j, None] + g[1] * A[:, 1, j, None] + g[2] * A[:, 2, j, None]
+         for j in range(3)]
+    rho = torch.sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]) + 1e-6
+    inv = 1 / rho
+    h = torch.zeros_like(rho)
+    for k in range(f.shape[1]):
+        h = h + amp[:, k, None] * torch.cos(
+            (q[0] * f[:, k, 0, None] + q[1] * f[:, k, 1, None] + q[2] * f[:, k, 2, None]) * inv
+            + ph[:, k, None])
+    return rho < 1 + rough[:, None] * h.clamp(-1.5, 1.5)
+
+
+def crop_scatter_args(inside, G, lo, bi, ids, S: int):
+    """Flat target index and amax value for every crop voxel (out-of-volume -> value 0)."""
+    vox = lo[:, None, :] + G[None].long()                                 # (K,V,3)
+    valid = ((vox >= 0) & (vox < S)).all(-1)
+    vox = vox.clamp(0, S - 1)
+    idx = ((bi[:, None] * S + vox[..., 0]) * S + vox[..., 1]) * S + vox[..., 2]
+    return idx, torch.where(inside & valid, ids[:, None], 0)
 
 
 # --------------------------------------------------------------------------- trees (CPU)
@@ -110,7 +142,7 @@ def grow_trees_points(rng, size, n_trees, step=0.5, n_sub=3, tortuosity=0.08,
         dt = pts[grow, -1] - pts[grow, -2]
         dt /= np.linalg.norm(dt, axis=1, keepdims=True)
         rep = np.repeat(np.arange(len(kk)), kk)
-        child_i = np.concatenate([np.arange(n) for n in kk])
+        child_i = np.arange(len(rep)) - np.repeat(np.cumsum(kk) - kk, kk)  # 0..k-1 per parent
         u, v = _perp_basis(dt)
         n = len(rep)
         theta = np.deg2rad(rng.uniform(*angle_deg, n))
@@ -151,7 +183,8 @@ class SynthGenerator:
 
     def __init__(self, size=160, n_blobs=10, n_trees=6, blob_radius=(0.05, 0.11),
                  roughness=(0.25, 0.5), body_radii=(0.44, 0.40, 0.42), body_roughness=0.08,
-                 n_freq=12, freq=(1.5, 3.5), min_draw_radius=0.9, device=None, seed=None):
+                 n_freq=12, freq=(1.5, 3.5), min_draw_radius=0.9, device=None, seed=None,
+                 compile=None):
         self.S = size
         self.N = n_blobs
         self.T = n_trees
@@ -170,6 +203,17 @@ class SynthGenerator:
                                               "mps" if torch.backends.mps.is_available() else "cpu"))
         self.np_rng = np.random.default_rng(seed)
         dev = self.device
+        # MPS lacks scatter_reduce, so it keeps the padded/dummy-slot path. CUDA and CPU use
+        # batched blobs and amax-scatters (blob ids increase with paint order and tree ids
+        # exceed blob ids, so "later wins" is exactly "largest id wins").
+        self.fast = dev.type != "mps"
+        self.chunk_elems = 1 << 26  # cap on (voxels x Fourier terms) per field evaluation
+        # torch.compile fuses the blob/body field into one kernel (needs Triton + a C
+        # compiler). compile=None: on for CUDA, off elsewhere. Falls back to eager on failure.
+        self.compiled = (dev.type == "cuda") if compile is None else bool(compile)
+        if self.compiled:
+            self._field_c = torch.compile(star_field_ew, dynamic=True)
+            self._scatter_args_c = torch.compile(crop_scatter_args, dynamic=True)
         # Random numbers are drawn directly on the device (no host->device copies).
         try:
             self.g = torch.Generator(device=dev)
@@ -181,6 +225,10 @@ class SynthGenerator:
         self.W_bias = torch.from_numpy(cubic_interp_matrix(4, size)).to(dev)
         ax = torch.arange(size, dtype=torch.float32, device=dev)
         self.ax = ax
+        if self.fast:
+            grid = lambda n: torch.stack(torch.meshgrid(*[torch.arange(n, dtype=torch.float32,
+                                                                     device=dev)] * 3, indexing="ij"), -1).view(-1, 3)
+            self.grid_full, self.grid_crop = grid(size), grid(self.crop)
         # Ball offsets for splatting, one table per integer radius bucket.
         self.offsets = {}
         for R in range(1, 6):
@@ -196,6 +244,10 @@ class SynthGenerator:
 
     # ---------------------------------------------------------------- blobs
     def _shape_params(self, n):
+        t = lambda x: torch.from_numpy(x.astype(np.float32)).to(self.device)
+        return tuple(t(x) for x in self._shape_params_np(n))
+
+    def _shape_params_np(self, n):
         """CPU: random rotation (n,3,3), Fourier directions*freq (n,M,3), phases, amplitudes."""
         rng = self.np_rng
         q, r = np.linalg.qr(rng.normal(size=(n, 3, 3)))
@@ -205,8 +257,7 @@ class SynthGenerator:
         f *= (rng.uniform(*self.freq, (n, self.M)) / np.linalg.norm(f, axis=2))[..., None]
         ph = rng.uniform(0, 2 * np.pi, (n, self.M))
         amp = rng.normal(size=(n, self.M)) * np.sqrt(2 / self.M)  # h has unit variance
-        t = lambda x: torch.from_numpy(x.astype(np.float32)).to(self.device)
-        return t(q), t(f), t(ph), t(amp)
+        return q, f, ph, amp
 
     def _star_inside(self, z, y, x, c, rot, radii, f, ph, amp, rough):
         """Star-shaped blob test. z,y,x: (B,Z),(B,Y),(B,X) coordinates. Returns (B,Z,Y,X) bool."""
@@ -226,6 +277,117 @@ class SynthGenerator:
 
     @torch.no_grad()
     def blobs(self, B):
+        return self._blobs_fast(B) if self.fast else self._blobs_compat(B)
+
+    @torch.no_grad()
+    def paint_trees(self, labels, pts):
+        return self._paint_trees_fast(labels, pts) if self.fast else self._paint_trees_compat(labels, pts)
+
+    def _field(self, *args):
+        if self.compiled:
+            try:
+                return self._field_c(*args)
+            except Exception as e:  # no Triton / C compiler: stay eager from now on
+                import warnings
+                warnings.warn(f"torch.compile unavailable ({type(e).__name__}); using eager path")
+                self.compiled = False
+        return self._star_field(*args)
+
+    def _star_field(self, G, off, A, f, ph, amp, rough):
+        """Batched star-shaped test, chunked to bound memory.
+        G (V,3) integer grid offsets; off (K,3) grid origin minus centre; A (K,3,3) = rot / radii
+        (so q = (G + off) @ A); f (K,M,3); ph, amp (K,M); rough (K,). Returns (K,V) bool."""
+        K, V = A.shape[0], G.shape[0]
+        out = torch.empty(K, V, dtype=torch.bool, device=G.device)
+        n = max(1, self.chunk_elems // (V * self.M))
+        for s0 in range(0, K, n):
+            sl = slice(s0, s0 + n)
+            q = torch.bmm(G[None] + off[sl, None], A[sl])                    # (k,V,3)
+            rho = q.norm(dim=-1, keepdim=True) + 1e-6
+            ang = torch.baddbmm(ph[sl, None], q / rho, f[sl].transpose(1, 2)).cos_()  # (k,V,M)
+            h = torch.bmm(ang, amp[sl, :, None]).squeeze(-1).clamp_(-1.5, 1.5)
+            out[sl] = rho.squeeze(-1) < 1 + rough[sl, None] * h
+        return out
+
+    def _blobs_fast(self, B):
+        S, dev, rng, N, Cs = self.S, self.device, self.np_rng, self.N, self.crop
+        # Draw everything on the CPU in the same order as the compat path, then do a single
+        # host->device copy so the kernels below run without host syncs (the CPU can grow
+        # tree skeletons meanwhile).
+        r_body = self.body_radii * S * rng.uniform(0.9, 1.1, (B, 3))
+        _, fb, phb, ampb = self._shape_params_np(B)
+        P = []
+        for i in range(N):
+            ctr = S / 2 + rng.uniform(-0.3, 0.3, (B, 3)) * S
+            radii = rng.uniform(*self.blob_radius, (B, 1)) * S * rng.uniform(0.7, 1.3, (B, 3))
+            rough = rng.uniform(*self.rough, B)
+            lo = np.round(ctr).astype(np.int64) - Cs // 2
+            rot, f, ph, amp = self._shape_params_np(B)
+            P.append((ctr, radii, rough, lo, rot, f, ph, amp))
+        ctr, radii, rough, lo, rot, f, ph, amp = (np.stack(x, 1).reshape(B * N, *x[0].shape[1:])
+                                                  for x in zip(*P))      # blob-major per sample
+        A = rot / radii[:, None, :]
+        flat = np.concatenate([a.reshape(-1) for a in (
+            np.eye(3) / r_body[:, None, :], np.full((B, 3), -S / 2), fb, phb, ampb,
+            A, lo - ctr, f, ph, amp, rough)]).astype(np.float32)
+        lo_t = torch.from_numpy(lo).to(dev)
+        buf = torch.from_numpy(flat).to(dev)
+        sizes = [B * 9, B * 3, B * self.M * 3, B * self.M, B * self.M,
+                 B * N * 9, B * N * 3, B * N * self.M * 3, B * N * self.M, B * N * self.M, B * N]
+        (Ab, offb, fb, phb, ampb, A, off, f, ph, amp, rough) = torch.split(buf, sizes)
+        M = self.M
+        # Body: full volume, axis-aligned.
+        body = self._field(self.grid_full, offb.view(B, 3), Ab.view(B, 3, 3), fb.view(B, M, 3),
+                                phb.view(B, M), ampb.view(B, M),
+                                torch.full((B,), self.body_rough, device=dev)).view(B, S, S, S)
+        # Blobs: fixed-size crops, scattered with amax (blob i has id i+2).
+        inside = self._field(self.grid_crop, off.view(-1, 3), A.view(-1, 3, 3),
+                                  f.view(-1, M, 3), ph.view(-1, M), amp.view(-1, M), rough)
+        bi = torch.arange(B, device=dev).repeat_interleave(N)
+        ids = (torch.arange(N, device=dev) + 2).repeat(B)
+        fn = self._scatter_args_c if self.compiled else crop_scatter_args
+        idx, val = fn(inside, self.grid_crop, lo_t, bi, ids, S)
+        labels = body.view(-1).long()
+        labels.scatter_reduce_(0, idx.view(-1), val.view(-1), "amax")
+        labels = labels.view(B, S, S, S) * body                           # clip blobs to body
+        self.body = body
+        return labels
+
+    def _paint_trees_fast(self, labels, pts):
+        S, dev = self.S, self.device
+        B = labels.shape[0]
+        P, R, t, b = pts
+        R = np.maximum(R, self.min_r)
+        bucket = np.minimum(np.ceil(R).astype(np.int64), max(self.offsets))
+        order = np.argsort(bucket, kind="stable")
+        counts = np.bincount(bucket, minlength=max(self.offsets) + 1)
+        lab = (self.tree_base + 1 + t).astype(np.int64)
+        data = np.concatenate([P[order].ravel(), R[order]]).astype(np.float32)
+        ints = np.concatenate([b[order], lab[order]]).astype(np.int64)
+        pin = dev.type == "cuda"
+        data, ints = (torch.from_numpy(x) for x in (data, ints))
+        if pin:
+            data, ints = data.pin_memory(), ints.pin_memory()
+        data, ints = data.to(dev, non_blocking=pin), ints.to(dev, non_blocking=pin)
+        n = len(order)
+        Pt, Rt, bt, lt = data[:3 * n].view(n, 3), data[3 * n:], ints[:n], ints[n:]
+        out = labels.reshape(-1).clone()
+        s0 = 0
+        for Rb in range(1, max(self.offsets) + 1):  # one amax-scatter per radius bucket
+            e0 = s0 + int(counts[Rb])
+            if e0 > s0:
+                p, r = Pt[s0:e0], Rt[s0:e0]
+                vox = p.round().int()[:, None, :] + self.offsets[Rb][None]
+                ok = ((vox.float() - p[:, None]).norm(dim=-1) <= r[:, None]) & \
+                     ((vox >= 0) & (vox < S)).all(-1)
+                vox = vox.long().clamp_(0, S - 1)
+                idx = ((bt[s0:e0, None] * S + vox[..., 0]) * S + vox[..., 1]) * S + vox[..., 2]
+                out.scatter_reduce_(0, idx.view(-1), torch.where(ok, lt[s0:e0, None], 0).view(-1), "amax")
+            s0 = e0
+        return out.view(B, S, S, S)
+
+    @torch.no_grad()
+    def _blobs_compat(self, B):
         S, dev, rng = self.S, self.device, self.np_rng
         t = lambda x: torch.from_numpy(np.asarray(x, np.float32)).to(dev)
         # Body: full volume, axis-aligned, radii jittered +-10% per sample.
@@ -271,6 +433,9 @@ class SynthGenerator:
     # ---------------------------------------------------------------- trees
     def tree_points(self, B):
         """CPU: dense skeleton points for B volumes (cheap; can live in DataLoader workers)."""
+        if self.fast:  # grow all B*T trees in one vectorized call (per-level cost is mostly overhead)
+            P, R, t = grow_trees_points(self.np_rng, self.S, B * self.T, inward=True)
+            return [P, R, t % self.T, t // self.T]
         out = []
         for b in range(B):
             P, R, t = grow_trees_points(self.np_rng, self.S, self.T, inward=True)
@@ -278,7 +443,7 @@ class SynthGenerator:
         return [np.concatenate(x) for x in zip(*out)]
 
     @torch.no_grad()
-    def paint_trees(self, labels, pts):
+    def _paint_trees_compat(self, labels, pts):
         """Splat tree points as balls. No data-dependent shapes, so there are no host syncs:
         points are grouped on the CPU by (tree, radius bucket), and voxels outside the ball or
         the volume are written to a dummy slot at the end of a padded flat buffer."""
@@ -327,7 +492,7 @@ class SynthGenerator:
     @torch.no_grad()
     def synth_image(self, labels):
         B, S, dev = labels.shape[0], self.S, self.device
-        L = int(labels.max()) + 1
+        L = self.tree_base + self.T + 1  # static: avoids a host sync on labels.max()
         means = self._rand(B, L) * 255
         stds = self._rand(B, L) * 25
         flat = labels.view(B, -1)
@@ -339,6 +504,17 @@ class SynthGenerator:
         x = torch.arange(-rad, rad + 1, device=dev, dtype=torch.float32)
         k = torch.exp(-x[None] ** 2 / (2 * sig[:, None] ** 2))
         k = (k / k.sum(1, keepdim=True)).view(B, 1, -1)
+        if self.fast:
+            # Same blur as three batched matmuls with a banded (S,S) matrix per sample;
+            # replicate padding is folded in by clamping the column index.
+            src = (torch.arange(S, device=dev)[:, None] + x.long()[None]).clamp_(0, S - 1)  # (S,2r+1)
+            Wb = torch.zeros(B, S, S, device=dev)
+            Wb.scatter_add_(2, src.expand(B, S, -1), k.view(B, 1, -1).expand(B, S, -1).contiguous())
+            img = img.view(B, S, S, S)
+            img = torch.matmul(img, Wb.transpose(1, 2)[:, None])                          # x
+            img = torch.matmul(Wb[:, None], img)                                          # y
+            img = torch.matmul(Wb, img.view(B, S, S * S)).view(B, S, S, S)                # z
+            return self._finish_image(img)
         # Replicate padding (zero padding would darken the volume borders).
         img = F.conv3d(F.pad(img, (0, 0, 0, 0, rad, rad), mode="replicate"),
                        k.view(B, 1, -1, 1, 1), groups=B)
@@ -346,7 +522,10 @@ class SynthGenerator:
                        k.view(B, 1, 1, -1, 1), groups=B)
         img = F.conv3d(F.pad(img, (rad, rad, 0, 0, 0, 0), mode="replicate"),
                        k.view(B, 1, 1, 1, -1), groups=B)
-        img = img.view(B, S, S, S)
+        return self._finish_image(img.view(B, S, S, S))
+
+    def _finish_image(self, img):
+        B, S = img.shape[0], self.S
         bias = torch.exp(upsample3d(self._randn(B, 4, 4, 4) * 0.3, self.W_bias))
         img = img * bias + self._randn(B, S, S, S) * (2 + 6 * self._rand(B, 1, 1, 1))
         lo = img.view(B, -1).amin(1).view(B, 1, 1, 1)

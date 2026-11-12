@@ -15,7 +15,7 @@ A) One or more GPUs (recommended). Each process / DDP rank owns a generator on i
 
 B) GPU + CPU workers. Only the (tiny) tree skeletons are grown in DataLoader workers,
    overlapping with GPU work; the GPU does everything voxel-sized. Rarely needed: the
-   skeletons cost about 2 ms/volume.
+   skeletons cost about 1 ms/volume and already overlap with queued GPU work.
 
 C) CPU-only nodes. Each DataLoader worker runs a full generator on the CPU with 1-2
    threads. Throughput scales with cores.

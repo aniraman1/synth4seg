@@ -51,6 +51,20 @@ Install PyTorch for your platform (CUDA build, or the default build for macOS/MP
 by following <https://pytorch.org/get-started/locally/> if the default wheel is not right for you.
 `pyvista` is only needed for the 3D render.
 
+**Linux + NVIDIA GPU.** The fast CUDA path uses `torch.compile`, which needs Triton (bundled
+with the CUDA PyTorch wheels) and a C compiler (`sudo apt install build-essential`). Without a
+compiler the generator falls back to a slower eager path and prints a warning.
+
+**Devcontainer.** `../.devcontainer/` builds on `pytorch/pytorch:2.7.1-cuda12.6-cudnn9-runtime`,
+installs `build-essential` and `requirements.txt`, and starts with `--gpus=all`. Open the
+`synthseg` folder in VS Code and choose *Reopen in Container*. The CUDA 12.6 image needs an
+NVIDIA driver ≥ 560.
+
+**Headless 3D render.** `render3d.png` needs an OpenGL context. With no display (SSH, batch
+jobs, plain `docker run`), install an offscreen backend, e.g.
+`apt install libosmesa6 libegl1`. Otherwise the render step logs EGL/OSMesa warnings and
+`render3d.png` is not written. Everything else is still produced.
+
 ---
 
 ## Quick start
@@ -59,8 +73,12 @@ by following <https://pytorch.org/get-started/locally/> if the default wheel is 
 # Default: fast CPU "smash" generator, 160³ volume
 python demo.py
 
-# GPU/MPS/CPU batched generator (the one used for training)
-python demo.py --method gpu --device mps --out outputs_gpu
+# Batched generator (the one used for training); picks cuda → mps → cpu automatically
+python demo.py --method gpu --out outputs_gpu
+python demo.py --method gpu --device mps --out outputs_gpu   # force a device
+
+# Several volumes: one run per volume, each with its own seed
+for s in 0 1 2; do python demo.py --method gpu --seed $s --out outputs_gpu/seed$s; done
 
 # Careful placement generator with an enclosing body
 python demo.py --method place --n-blobs 10 --n-trees 6
@@ -68,6 +86,11 @@ python demo.py --method place --n-blobs 10 --n-trees 6
 # Open an interactive 3D window as well
 python demo.py --method gpu --show
 ```
+
+`demo.py` writes one volume per run. On CUDA, the first call to the `gpu` generator spends about
+7 s compiling its fused kernels, then each volume takes a few milliseconds. A demo run takes
+about 15 s in total, most of it writing the GIF and NIfTI files. Use `bench.py` to measure
+generation speed.
 
 Each run writes to `--out` (default `outputs/`):
 
@@ -116,6 +139,10 @@ image, labels, semantic = gen.sample(4)
 
 `gen.label_type(k)` returns the type of instance id `k`. `gen.tree_base` equals `n_blobs + 1`.
 
+`SynthGenerator(..., compile=None)`: by default `torch.compile` is on for CUDA and off
+elsewhere. Pass `compile=False` to skip the ~7 s warm-up, e.g. for quick tests. Expect
+one extra short recompile the first time `B=1` is used.
+
 `train_example.py` documents three ways to feed training:
 
 - **A. One or more GPUs (recommended).** Each process or DDP rank owns a generator on its
@@ -131,7 +158,7 @@ image, labels, semantic = gen.sample(4)
   Launch with `torchrun --nproc_per_node=<n_gpus> train.py`.
 - **B. GPU + CPU workers.** DataLoader workers only grow the small tree skeletons
   (`TreeSkeletons`), which you pass in with `gen.sample(B, tree_pts=...)`. Rarely worth it,
-  because skeletons cost about 2 ms per volume.
+  because skeletons cost about 1 ms per volume and already overlap with GPU work.
 - **C. CPU-only nodes.** Each DataLoader worker runs a full CPU generator (`CPUVolumes`).
   To benchmark it, run `python train_example.py <num_workers>`.
 
@@ -180,7 +207,29 @@ For each label: mean ~ U(0, 255), std ~ U(0, 25), Gaussian sample → Gaussian b
 
 ### Notes on device support
 
-`synth_gpu.py` uses only basic tensor ops, because MPS lacks 3D `interpolate`,
+**CUDA / CPU (fast path).** All blobs in a batch are evaluated in one batched call and
+written with a single `scatter_reduce(amax)`. Blob ids increase with paint order and tree
+ids are larger than blob ids, so "later wins" is the same as "largest id wins". Trees are
+painted with one scatter per radius bucket. On CUDA the star-shape test is fused into one
+kernel with `torch.compile` (needs Triton and a C compiler, e.g. `build-essential`). The
+first call compiles for about 7 s; pass `compile=False` to skip it, and the code also falls
+back to eager automatically if compilation fails. The Gaussian blur uses batched matmuls with
+banded matrices, and `sample()` has no host syncs, so CPU-side tree growth overlaps with GPU
+work. Labels match the MPS path for the same seed, apart from very rare float-rounding
+differences at a boundary voxel. Tree skeletons for a batch are grown in one vectorised call,
+so the random stream differs from MPS but the distribution is the same.
+
+Benchmark with `python bench.py --device cuda --batch 1 4 8 16`. Results on one RTX 3090,
+160³, torch 2.7.1:
+
+| batch | before (ms/vol) | after (ms/vol) | after (vol/s) |
+|---|---|---|---|
+| 1 | 52.4 | 8.7 | 115 |
+| 4 | 25.5 | 4.5 | 221 |
+| 8 | 23.2 | 3.8 | 261 |
+| 16 | n/a | 3.6 | 275 |
+
+**MPS (compat path).** `synth_gpu.py` uses only basic tensor ops there, because MPS lacks 3D `interpolate`,
 `scatter_reduce`, `max_pool3d` and `cummin`. Upsampling is done with separable Catmull–Rom
 matrix products, writes go into padded flat buffers with dummy slots (no data-dependent
 shapes, no host syncs), and point groups are padded to power-of-two lengths so MPS compiles
@@ -194,6 +243,7 @@ only a few graphs.
 synth4seg/
 ├── demo.py               # CLI: generate one volume, save NIfTI + visualisations
 ├── train_example.py      # training integration patterns + CPU-worker benchmark
+├── bench.py              # per-stage timing of SynthGenerator.sample()
 ├── requirements.txt
 ├── docs/images/          # README preview images
 └── src/
