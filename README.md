@@ -7,7 +7,7 @@ bias field and noise). Because every volume is generated from scratch, you get u
 perfectly labelled training pairs, and the network learns shape rather than any
 particular contrast.
 
-The importable Python package is called `synthvol`.
+The importable Python package is `src` (e.g. `from src.synth_gpu import SynthGenerator`).
 
 | Slices (labels / image / tree projections) | 3D render |
 |---|---|
@@ -18,11 +18,11 @@ The importable Python package is called `synthvol`.
 ## Features
 
 - **Three generators**
-  - `gpu` (`synthvol.synth_gpu.SynthGenerator`): batched, on-the-fly, runs on CUDA, Apple MPS
+  - `gpu` (`src.synth_gpu.SynthGenerator`): batched, on-the-fly, runs on CUDA, Apple MPS
     or CPU. Produces labels and images together. Use this one for training.
-  - `smash` (`synthvol.smash`): fast CPU generator. Space is split into blobs by an argmax
+  - `smash` (`src.smash`): fast CPU generator. Space is split into blobs by an argmax
     over smooth noise fields, then trees are painted on top.
-  - `place` (`synthvol.compose`): slow, careful CPU generator. Blobs and trees are placed
+  - `place` (`src.compose`): slow, careful CPU generator. Blobs and trees are placed
     one at a time inside an enclosing "body", with overlap and connectivity checks.
 - **IFS branching trees**: each branch is a contractive affine copy of its parent
   (branch angle, phyllotaxis roll, length scaling). Radii follow Murray's law and branches
@@ -102,7 +102,7 @@ Each run writes to `--out` (default `outputs/`):
 ## Using the generator for training
 
 ```python
-from synthvol.synth_gpu import SynthGenerator
+from src.synth_gpu import SynthGenerator
 
 gen = SynthGenerator(size=160, n_blobs=10, n_trees=6, device="cuda", seed=0)
 image, labels, semantic = gen.sample(4)
@@ -196,7 +196,7 @@ synth4seg/
 ├── train_example.py      # training integration patterns + CPU-worker benchmark
 ├── requirements.txt
 ├── docs/images/          # README preview images
-└── synthvol/
+└── src/
     ├── synth_gpu.py      # SynthGenerator: batched CUDA/MPS/CPU generator (labels + image)
     ├── smash.py          # fast noise-argmax blobs + trees (CPU)
     ├── compose.py        # careful body + blobs + trees placement (CPU)

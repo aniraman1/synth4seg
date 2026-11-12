@@ -29,7 +29,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 
-from synthvol.synth_gpu import SynthGenerator
+from src.synth_gpu import SynthGenerator
 
 
 class TreeSkeletons(IterableDataset):
@@ -39,7 +39,7 @@ class TreeSkeletons(IterableDataset):
         self.B, self.size, self.T, self.seed = batch_size, size, n_trees, seed
 
     def __iter__(self):
-        from synthvol.synth_gpu import grow_trees_points
+        from src.synth_gpu import grow_trees_points
         wi = get_worker_info()
         rng = np.random.default_rng([self.seed, wi.id if wi else 0])
         while True:

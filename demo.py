@@ -16,11 +16,11 @@ import nibabel as nib
 import numpy as np
 from scipy import ndimage
 
-from synthvol.compose import CONN26, make_volume
-from synthvol.intensity import synth_image
-from synthvol.smash import make_volume_smash
-from synthvol.synth_gpu import SynthGenerator
-from synthvol.viz import render_3d, save_slice_gif, save_slices
+from src.compose import CONN26, make_volume
+from src.intensity import synth_image
+from src.smash import make_volume_smash
+from src.synth_gpu import SynthGenerator
+from src.viz import render_3d, save_slice_gif, save_slices
 
 
 def main():
