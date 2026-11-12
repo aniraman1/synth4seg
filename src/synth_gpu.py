@@ -184,7 +184,8 @@ class SynthGenerator:
     def __init__(self, size=160, n_blobs=10, n_trees=6, blob_radius=(0.05, 0.11),
                  roughness=(0.25, 0.5), body_radii=(0.44, 0.40, 0.42), body_roughness=0.08,
                  n_freq=12, freq=(1.5, 3.5), min_draw_radius=0.9, device=None, seed=None,
-                 compile=None):
+                 compile=None, bright_foreground=True, bg_mean_range=(0, 110),
+                 fg_mean_range=(140, 255)):
         self.S = size
         self.N = n_blobs
         self.T = n_trees
@@ -196,6 +197,12 @@ class SynthGenerator:
         self.freq = freq
         self.min_r = min_draw_radius
         self.tree_base = n_blobs + 1
+        # Intensity priors. bright_foreground: background/body means are drawn from
+        # bg_mean_range and blob/tree means from fg_mean_range, so every structure to be
+        # segmented is brighter than its surroundings. Otherwise all means are U(0, 255).
+        self.bright_fg = bright_foreground
+        self.bg_mean_range = bg_mean_range
+        self.fg_mean_range = fg_mean_range
         # Fixed crop for every blob: covers radius * 1.3 (axis jitter) * (1 + 1.5*max rough).
         rmax = blob_radius[1] * 1.3 * size * (1 + 1.5 * roughness[1])
         self.crop = int(2 * np.ceil(rmax) + 3)
@@ -493,7 +500,13 @@ class SynthGenerator:
     def synth_image(self, labels):
         B, S, dev = labels.shape[0], self.S, self.device
         L = self.tree_base + self.T + 1  # static: avoids a host sync on labels.max()
-        means = self._rand(B, L) * 255
+        if self.bright_fg:
+            fg = torch.arange(L, device=dev) > 1                     # blobs + trees
+            lo = torch.where(fg, self.fg_mean_range[0], self.bg_mean_range[0]).float()
+            hi = torch.where(fg, self.fg_mean_range[1], self.bg_mean_range[1]).float()
+            means = lo + (hi - lo) * self._rand(B, L)
+        else:
+            means = self._rand(B, L) * 255
         stds = self._rand(B, L) * 25
         flat = labels.view(B, -1)
         img = means.gather(1, flat) + stds.gather(1, flat) * self._randn(B, S ** 3)

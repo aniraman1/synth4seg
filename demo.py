@@ -73,7 +73,8 @@ def main():
                                    args.n_trees if args.n_trees is not None else 6, args.seed)
     t1 = time.time()
     if image is None:
-        image = synth_image(labels, np.random.default_rng(args.seed + 1))
+        surround = [k for k, m in meta.items() if m["type"] in ("background", "body")]
+        image = synth_image(labels, np.random.default_rng(args.seed + 1), surround_ids=surround)
     t2 = time.time()
     if args.method == "gpu":
         print(f"generated {labels.shape}: labels + image {t1 - t0:.2f}s (incl. copy to host)")
