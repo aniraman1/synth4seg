@@ -211,6 +211,36 @@ in DataLoader workers and generation is already asynchronous); with `device="cpu
 With persistent workers (the `synth_loader` default) `set_epoch` does not reach the workers;
 their streams simply continue.
 
+### Segmenting a variable number of structures (`coassignment_loss`)
+
+`src.losses.coassignment_loss` trains a network to split an image into its structures
+without fixing which output channel each structure goes to. The network outputs K channels
+(K ≥ the largest number of structures per example, plus a few spare). A softmax over them
+assigns every voxel to a slot. The loss asks that two voxels share a slot exactly when they
+belong to the same structure, so it does not depend on channel order and spare channels stay
+empty.
+
+```python
+from src.dataset import SynthDataset
+from src.losses import coassignment_loss, matched_dice
+
+ds = SynthDataset(batch_size=2, target="labels", n_blobs=(2, 12), n_trees=(0, 6))
+model = UNet(out_channels=ds.n_label_classes + 4)
+for image, labels in ds:
+    logits = model(image)                       # (B, K, S, S, S)
+    loss = coassignment_loss(logits, labels)    # labels: any id numbering
+    ...
+    dice = matched_dice(logits.argmax(1), labels)   # (B,) mean Dice after Hungarian matching
+```
+
+The loss is computed exactly over **all** voxel pairs, with no sampling and no N×N matrix.
+For structures a and b, the mean predicted co-assignment over their voxel pairs is
+`S_ab = m_a · m_b`, where `m_a` is the mean softmax vector over structure a. The loss is
+`mean_a [ −log S_aa + neg_weight · Σ_{b≠a} −log(1 − S_ab) ]`. Every structure counts
+equally, so a thin tree weighs as much as the background. Cost is O(N·K): about 65 ms
+forward + backward and 4 GiB peak for B=2, 160³, K=24 on an RTX 3090.
+`match_channels(pred, labels)` gives the per-structure matching and Dice for evaluation.
+
 `train_example.py` documents three ways to feed training:
 
 - **A. One or more GPUs (recommended).** Each process or DDP rank owns a generator on its
@@ -317,6 +347,7 @@ synth4seg/
 └── src/
     ├── synth_gpu.py      # SynthGenerator: batched CUDA/MPS/CPU generator (labels + image)
     ├── dataset.py        # SynthDataset / synth_loader: on-the-fly PyTorch training stream
+    ├── losses.py         # permutation-invariant co-assignment loss + matched Dice
     ├── smash.py          # fast noise-argmax blobs + trees (CPU)
     ├── compose.py        # careful body + blobs + trees placement (CPU)
     ├── blobs.py          # noise-perturbed rotated ellipsoid blobs
