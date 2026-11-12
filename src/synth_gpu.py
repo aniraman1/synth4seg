@@ -172,13 +172,28 @@ def grow_trees_points(rng, size, n_trees, step=0.5, n_sub=3, tortuosity=0.08,
 
 
 # --------------------------------------------------------------------------- generator
+def count_range(n, name="count"):
+    """int n -> (n, n); (lo, hi) -> (lo, hi), inclusive. Requires 0 <= lo <= hi, hi >= 1."""
+    lo, hi = (n, n) if np.ndim(n) == 0 else tuple(n)
+    lo, hi = int(lo), int(hi)
+    if not 0 <= lo <= hi or hi < 1:
+        raise ValueError(f"{name} must be an int >= 1 or a (lo, hi) range with "
+                         f"0 <= lo <= hi and hi >= 1, got {n!r}")
+    return lo, hi
+
+
 class SynthGenerator:
     """gen = SynthGenerator(device="cuda"); image, labels, semantic = gen.sample(4)
 
     image    (B,1,S,S,S) float32 in [0,1]
-    labels   (B,S,S,S)   int64: 0 background, 1 body, 2..n_blobs+1 blobs,
-                         n_blobs+2 .. n_blobs+n_trees+1 trees (gen.tree_base = n_blobs+1)
+    labels   (B,S,S,S)   int64: 0 background, 1 body, 2..N+1 blobs,
+                         N+2 .. N+T+1 trees (gen.tree_base = N+1)
     semantic (B,S,S,S)   int64: 0 background, 1 body, 2 blob, 3 tree
+
+    n_blobs / n_trees: an int, or an inclusive (lo, hi) range drawn independently for each
+    example. N and T above are the maxima (gen.N, gen.T): an example with k blobs uses
+    ids 2..k+1, and its other blob and tree slots are simply absent. The counts drawn for
+    the last batch are in gen.last_n_blobs / gen.last_n_trees, each an int array of shape (B,).
     """
 
     def __init__(self, size=160, n_blobs=10, n_trees=6, blob_radius=(0.05, 0.11),
@@ -187,8 +202,12 @@ class SynthGenerator:
                  compile=None, bright_foreground=True, bg_mean_range=(0, 110),
                  fg_mean_range=(140, 255)):
         self.S = size
-        self.N = n_blobs
-        self.T = n_trees
+        # Shapes are sized for the maximum counts; unused slots are switched off per example.
+        self.n_blobs_range = count_range(n_blobs, "n_blobs")
+        self.n_trees_range = count_range(n_trees, "n_trees")
+        self.N = self.n_blobs_range[1]
+        self.T = self.n_trees_range[1]
+        self.last_n_blobs = self.last_n_trees = None
         self.blob_radius = blob_radius
         self.rough = roughness
         self.body_radii = np.asarray(body_radii)
@@ -196,7 +215,7 @@ class SynthGenerator:
         self.M = n_freq
         self.freq = freq
         self.min_r = min_draw_radius
-        self.tree_base = n_blobs + 1
+        self.tree_base = self.N + 1
         # Intensity priors. bright_foreground: background/body means are drawn from
         # bg_mean_range and blob/tree means from fg_mean_range, so every structure to be
         # segmented is brighter than its surroundings. Otherwise all means are U(0, 255).
@@ -208,7 +227,6 @@ class SynthGenerator:
         self.crop = int(2 * np.ceil(rmax) + 3)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else
                                               "mps" if torch.backends.mps.is_available() else "cpu"))
-        self.np_rng = np.random.default_rng(seed)
         dev = self.device
         # MPS lacks scatter_reduce, so it keeps the padded/dummy-slot path. CUDA and CPU use
         # batched blobs and amax-scatters (blob ids increase with paint order and tree ids
@@ -226,9 +244,7 @@ class SynthGenerator:
             self.g = torch.Generator(device=dev)
         except RuntimeError:  # backends without device generators
             self.g = None
-            torch.manual_seed(int(self.np_rng.integers(2**62)))
-        if self.g is not None:
-            self.g.manual_seed(int(self.np_rng.integers(2**62)))
+        self.reseed(seed)
         self.W_bias = torch.from_numpy(cubic_interp_matrix(4, size)).to(dev)
         ax = torch.arange(size, dtype=torch.float32, device=dev)
         self.ax = ax
@@ -242,6 +258,19 @@ class SynthGenerator:
             o = torch.stack(torch.meshgrid(*[torch.arange(-R, R + 1)] * 3, indexing="ij"), -1)
             o = o.reshape(-1, 3)
             self.offsets[R] = o[(o.float().norm(dim=1) <= R + 0.87)].int().to(dev)
+
+    def reseed(self, seed=None):
+        """Restart both random streams (CPU numpy + device torch) from `seed`.
+
+        `seed` may be anything np.random.default_rng accepts (int, list of ints,
+        SeedSequence, None for fresh OS entropy). Cheap: compiled kernels are kept.
+        """
+        self.np_rng = np.random.default_rng(seed)
+        torch_seed = int(self.np_rng.integers(2**62))
+        if self.g is not None:
+            self.g.manual_seed(torch_seed)
+        else:
+            torch.manual_seed(torch_seed)
 
     def _rand(self, *shape):
         return torch.rand(*shape, generator=self.g, device=self.device)
@@ -282,9 +311,22 @@ class SynthGenerator:
                 (q[0] * fk[:, 0] + q[1] * fk[:, 1] + q[2] * fk[:, 2]) / rho + ph[:, k, None, None, None])
         return rho < 1 + rough[:, None, None, None] * h.clamp(-1.5, 1.5)
 
+    def _counts(self, B, n, rng_range):
+        """Per-example counts (B,) int64: given `n` (int or (B,)), else drawn from rng_range.
+        A fixed count draws no random numbers, so fixed-count streams are unchanged."""
+        lo, hi = rng_range
+        if n is None:
+            n = hi if lo == hi else self.np_rng.integers(lo, hi + 1, B)
+        n = np.broadcast_to(np.asarray(n, np.int64), (B,)).copy()
+        if n.min() < 0 or n.max() > hi:
+            raise ValueError(f"counts must be in [0, {hi}], got {n}")
+        return n
+
     @torch.no_grad()
-    def blobs(self, B):
-        return self._blobs_fast(B) if self.fast else self._blobs_compat(B)
+    def blobs(self, B, n_blobs=None):
+        """Body + blobs label volume (B,S,S,S). n_blobs: int or (B,) counts; None = draw."""
+        nb = self.last_n_blobs = self._counts(B, n_blobs, self.n_blobs_range)
+        return self._blobs_fast(B, nb) if self.fast else self._blobs_compat(B, nb)
 
     @torch.no_grad()
     def paint_trees(self, labels, pts):
@@ -316,7 +358,7 @@ class SynthGenerator:
             out[sl] = rho.squeeze(-1) < 1 + rough[sl, None] * h
         return out
 
-    def _blobs_fast(self, B):
+    def _blobs_fast(self, B, nb):
         S, dev, rng, N, Cs = self.S, self.device, self.np_rng, self.N, self.crop
         # Draw everything on the CPU in the same order as the compat path, then do a single
         # host->device copy so the kernels below run without host syncs (the CPU can grow
@@ -337,7 +379,11 @@ class SynthGenerator:
         flat = np.concatenate([a.reshape(-1) for a in (
             np.eye(3) / r_body[:, None, :], np.full((B, 3), -S / 2), fb, phb, ampb,
             A, lo - ctr, f, ph, amp, rough)]).astype(np.float32)
-        lo_t = torch.from_numpy(lo).to(dev)
+        # Blob i of example b has id i+2 if i < nb[b], else 0 (an amax no-op: slot unused).
+        slot = np.arange(N)
+        ids = np.where(slot[None] < nb[:, None], slot[None] + 2, 0).reshape(-1)
+        ints = torch.from_numpy(np.concatenate([lo.reshape(-1), ids])).to(dev)
+        lo_t, ids = ints[:B * N * 3].view(B * N, 3), ints[B * N * 3:]
         buf = torch.from_numpy(flat).to(dev)
         sizes = [B * 9, B * 3, B * self.M * 3, B * self.M, B * self.M,
                  B * N * 9, B * N * 3, B * N * self.M * 3, B * N * self.M, B * N * self.M, B * N]
@@ -351,7 +397,6 @@ class SynthGenerator:
         inside = self._field(self.grid_crop, off.view(-1, 3), A.view(-1, 3, 3),
                                   f.view(-1, M, 3), ph.view(-1, M), amp.view(-1, M), rough)
         bi = torch.arange(B, device=dev).repeat_interleave(N)
-        ids = (torch.arange(N, device=dev) + 2).repeat(B)
         fn = self._scatter_args_c if self.compiled else crop_scatter_args
         idx, val = fn(inside, self.grid_crop, lo_t, bi, ids, S)
         labels = body.view(-1).long()
@@ -394,7 +439,7 @@ class SynthGenerator:
         return out.view(B, S, S, S)
 
     @torch.no_grad()
-    def _blobs_compat(self, B):
+    def _blobs_compat(self, B, nb):
         S, dev, rng = self.S, self.device, self.np_rng
         t = lambda x: torch.from_numpy(np.asarray(x, np.float32)).to(dev)
         # Body: full volume, axis-aligned, radii jittered +-10% per sample.
@@ -417,6 +462,7 @@ class SynthGenerator:
         dummy = (n_vox + torch.arange(B * Cs ** 3, device=dev)).view(B, Cs, Cs, Cs)
         ar = torch.arange(Cs, device=dev, dtype=torch.float32)
         bidx = torch.arange(B, device=dev, dtype=torch.int64)[:, None, None, None]
+        active = torch.from_numpy(np.arange(self.N)[None] < nb[:, None]).to(dev)  # (B,N)
         for i in range(self.N):
             ctr = S / 2 + rng.uniform(-0.3, 0.3, (B, 3)) * S
             radii = rng.uniform(*self.blob_radius, (B, 1)) * S * rng.uniform(0.7, 1.3, (B, 3))
@@ -431,23 +477,34 @@ class SynthGenerator:
             idx = ((bidx * S + zi.clamp(0, S - 1)[:, :, None, None]) * S +
                    yi.clamp(0, S - 1)[:, None, :, None]) * S + xi.clamp(0, S - 1)[:, None, None, :]
             idx = torch.where(valid, idx, dummy)
-            ok = inside & body_flat[idx]
+            ok = inside & body_flat[idx] & active[:, i, None, None, None]
             # Write the blob id where ok; elsewhere rewrite the current value (a no-op).
             buf[idx.view(-1)] = torch.where(ok, i + 2, buf[idx]).view(-1)
         self.body = body
         return labels
 
     # ---------------------------------------------------------------- trees
-    def tree_points(self, B):
-        """CPU: dense skeleton points for B volumes (cheap; can live in DataLoader workers)."""
-        if self.fast:  # grow all B*T trees in one vectorized call (per-level cost is mostly overhead)
-            P, R, t = grow_trees_points(self.np_rng, self.S, B * self.T, inward=True)
-            return [P, R, t % self.T, t // self.T]
+    def tree_points(self, B, n_trees=None):
+        """CPU: dense skeleton points for B volumes (cheap; can live in DataLoader workers).
+        n_trees: int or (B,) counts; None = draw. Returns [P, R, tree slot, batch index]."""
+        nt = self.last_n_trees = self._counts(B, n_trees, self.n_trees_range)
+        empty = [np.zeros((0, 3), np.float32), np.zeros(0, np.float32),
+                 np.zeros(0, np.int64), np.zeros(0, np.int64)]
+        if self.fast:  # grow all trees in one vectorized call (per-level cost is mostly overhead)
+            total = int(nt.sum())
+            if total == 0:
+                return empty
+            P, R, t = grow_trees_points(self.np_rng, self.S, total, inward=True)
+            b_of = np.repeat(np.arange(B), nt)                        # tree -> example
+            slot = np.arange(total) - np.repeat(np.cumsum(nt) - nt, nt)  # tree -> slot in example
+            return [P, R, slot[t], b_of[t]]
         out = []
         for b in range(B):
-            P, R, t = grow_trees_points(self.np_rng, self.S, self.T, inward=True)
+            if nt[b] == 0:
+                continue
+            P, R, t = grow_trees_points(self.np_rng, self.S, int(nt[b]), inward=True)
             out.append((P, R, t, np.full(len(P), b, np.int64)))
-        return [np.concatenate(x) for x in zip(*out)]
+        return [np.concatenate(x) for x in zip(*out)] if out else empty
 
     @torch.no_grad()
     def _paint_trees_compat(self, labels, pts):
@@ -457,6 +514,8 @@ class SynthGenerator:
         S, dev = self.S, self.device
         B = labels.shape[0]
         P, R, t, b = pts
+        if len(P) == 0:
+            return labels
         R = np.maximum(R, self.min_r)
         bucket = np.minimum(np.ceil(R).astype(np.int64), max(self.offsets))
         order = np.lexsort((bucket, t))  # sort by tree, then bucket
@@ -547,9 +606,15 @@ class SynthGenerator:
 
     # ---------------------------------------------------------------- all
     @torch.no_grad()
-    def sample(self, B, tree_pts=None):
-        labels = self.blobs(B)
-        labels = self.paint_trees(labels, tree_pts if tree_pts is not None else self.tree_points(B))
+    def sample(self, B, tree_pts=None, n_blobs=None, n_trees=None):
+        """n_blobs / n_trees: optional int or (B,) per-example counts overriding the
+        configured range (ignored for trees when tree_pts is given)."""
+        labels = self.blobs(B, n_blobs)
+        if tree_pts is not None:
+            self.last_n_trees = None  # unknown: the caller grew the skeletons
+        else:
+            tree_pts = self.tree_points(B, n_trees)
+        labels = self.paint_trees(labels, tree_pts)
         labels = torch.where(self.body, labels, 0)                 # clip trees to the body
         semantic = torch.where(labels > self.tree_base, 3,
                                torch.where(labels > 1, 2, labels))  # 0 bg, 1 body, 2 blob, 3 tree

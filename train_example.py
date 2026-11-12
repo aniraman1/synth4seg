@@ -1,5 +1,10 @@
 """How to feed SynthGenerator into training. Three setups:
 
+Simplest: src.dataset.SynthDataset wraps setup A as a PyTorch IterableDataset:
+
+       ds = SynthDataset(batch_size=4, size=160, device="cuda", seed=0, steps=1000)
+       for image, semantic in ds: ...
+
 A) One or more GPUs (recommended). Each process / DDP rank owns a generator on its own GPU
    with its own seed. Volumes are made inside the training loop, so there's no DataLoader
    and no host->device copy of volumes:

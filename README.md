@@ -139,9 +139,77 @@ image, labels, semantic = gen.sample(4)
 
 `gen.label_type(k)` returns the type of instance id `k`. `gen.tree_base` equals `n_blobs + 1`.
 
+**Variable counts.** `n_blobs` and `n_trees` also accept an inclusive `(lo, hi)` range, and
+each example in a batch then draws its own counts:
+
+```python
+gen = SynthGenerator(size=160, n_blobs=(2, 12), n_trees=(0, 6), device="cuda")
+image, labels, semantic = gen.sample(4)
+gen.last_n_blobs, gen.last_n_trees      # e.g. array([ 7, 2, 12, 5]), array([3, 0, 6, 1])
+```
+
+Ids are numbered against the maximum (`gen.N = 12`, `gen.T = 6`, so `tree_base = 13`).
+An example with k blobs uses ids `2 … k+1`, and its remaining blob and tree slots are absent.
+Shapes stay static (unused slots are switched off, not removed), so there is no recompilation
+and speed is about the same as for the maximum count. You can also force counts for one call
+with `gen.sample(B, n_blobs=..., n_trees=...)` (int, or one per example). A fixed int count
+gives exactly the same volumes as before for a given seed.
+
 `SynthGenerator(..., compile=None)`: by default `torch.compile` is on for CUDA and off
 elsewhere. Pass `compile=False` to skip the ~7 s warm-up, e.g. for quick tests. Expect
 one extra short recompile the first time `B=1` is used.
+
+### On-the-fly training stream (`SynthDataset`)
+
+`src.dataset.SynthDataset` is a PyTorch `IterableDataset` that yields fresh batches straight
+from the generator. Every item is already a whole batch on the device.
+
+```python
+from src.dataset import SynthDataset
+
+ds = SynthDataset(batch_size=4, size=160, steps=1000, device="cuda", seed=0,
+                  target="semantic", n_blobs=10, n_trees=6)
+model = UNet(out_channels=ds.n_classes)          # 4 for "semantic"
+for epoch in range(n_epochs):
+    ds.set_epoch(epoch)                           # optional: reproducible stream per epoch
+    for image, target in ds:                      # (B,1,S,S,S) float, (B,S,S,S) int64 ids
+        loss = criterion(model(image), target)
+```
+
+| Argument | Default | Meaning |
+|---|---|---|
+| `batch_size` | `2` | volumes per yielded batch |
+| `steps` | `None` | batches per epoch; `None` = infinite. Also sets `len(ds)` |
+| `target` | `"semantic"` | `"semantic"` → `(image, semantic)`, `"labels"` → `(image, labels)`, `"both"` → `(image, labels, semantic)` |
+| `device` | auto | `None` picks `cuda:LOCAL_RANK` under torchrun, else cuda → mps → cpu |
+| `seed` | `None` | base seed; `None` = fresh entropy |
+| `image_dtype` | `float32` | e.g. `torch.bfloat16` for AMP |
+| `**gen_kwargs` | | passed to `SynthGenerator` (`n_blobs`, `n_trees` as an int or a `(lo, hi)` range, `compile`, ...) |
+
+`SynthDataset` puts the structures to segment first and body / background **last**, so its
+ids differ from the raw `SynthGenerator` ids above. Instance ids are numbered per example,
+with n, t = that example's blob and tree counts:
+
+| Target | Ids | Classes |
+|---|---|---|
+| `semantic` | `0` blob, `1` tree, `2` body, `3` background | `ds.n_semantic_classes` = 4 |
+| `labels` | `0 … n-1` blobs, `n … n+t-1` trees, `n+t` body, `n+t+1` background | n+t+2 per example; at most `ds.n_label_classes` = max n + max t + 2 |
+
+With fixed int counts every example has the same n and t. With `(lo, hi)` ranges the ids for
+body and background change from example to example: `ds.last_counts` holds the
+`(n_blobs, n_trees)` arrays of the last batch (main process only), and `ds.label_type(k, b)`
+gives the type of id `k` in example `b`. `ds.n_classes` is the class count for the chosen
+target (the semantic count for `"both"`). Targets are always integer ids; for a one-hot with
+one channel per object, use `F.one_hot(labels[b], n_b + t_b + 2)` on each example.
+
+Each (seed, DDP rank, DataLoader worker, epoch) gets an independent stream, so DDP ranks
+never see the same volumes. Without `set_epoch` the stream just continues across epochs.
+For frameworks that need a `DataLoader` (e.g. Lightning), use `synth_loader(**same_kwargs)`,
+which wraps the dataset with `batch_size=None`. Keep `num_workers=0` on GPU (CUDA cannot run
+in DataLoader workers and generation is already asynchronous); with `device="cpu"`,
+`num_workers > 0` runs one generator per worker process and `steps` is split across them.
+With persistent workers (the `synth_loader` default) `set_epoch` does not reach the workers;
+their streams simply continue.
 
 `train_example.py` documents three ways to feed training:
 
@@ -248,6 +316,7 @@ synth4seg/
 ├── docs/images/          # README preview images
 └── src/
     ├── synth_gpu.py      # SynthGenerator: batched CUDA/MPS/CPU generator (labels + image)
+    ├── dataset.py        # SynthDataset / synth_loader: on-the-fly PyTorch training stream
     ├── smash.py          # fast noise-argmax blobs + trees (CPU)
     ├── compose.py        # careful body + blobs + trees placement (CPU)
     ├── blobs.py          # noise-perturbed rotated ellipsoid blobs
