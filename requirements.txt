@@ -1,0 +1,7 @@
+numpy
+scipy
+torch
+nibabel
+matplotlib
+Pillow
+pyvista
